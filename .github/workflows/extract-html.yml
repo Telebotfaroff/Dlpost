@@ -1,0 +1,118 @@
+name: Extract HTML from URL
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: "Page URL to fetch (must start with http:// or https://)"
+        required: true
+        type: string
+      filename:
+        description: "Output filename without .html (optional)"
+        required: false
+        default: "page"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: extract-html
+  cancel-in-progress: false
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Fetch and save HTML
+        env:
+          PAGE_URL: ${{ inputs.url }}
+          OUTPUT_NAME: ${{ inputs.filename }}
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          import sys
+          from pathlib import Path
+          from urllib.parse import urlparse
+
+          import requests
+
+          url = os.environ["PAGE_URL"].strip()
+          parsed = urlparse(url)
+          if parsed.scheme not in ("http", "https") or not parsed.netloc:
+              sys.exit("Invalid URL: enter a full http:// or https:// URL.")
+
+          raw_name = os.environ.get("OUTPUT_NAME", "page").strip() or "page"
+          name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip(".-_")[:80]
+          if not name:
+              name = "page"
+
+          output_dir = Path("html")
+          output_dir.mkdir(parents=True, exist_ok=True)
+          output_path = output_dir / f"{name}.html"
+
+          headers = {
+              "User-Agent": (
+                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+              ),
+              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+          }
+
+          try:
+              with requests.get(
+                  url, headers=headers, timeout=(15, 30), stream=True,
+                  allow_redirects=True
+              ) as response:
+                  response.raise_for_status()
+                  content_type = response.headers.get("Content-Type", "").lower()
+                  if "text/html" not in content_type and "xhtml" not in content_type:
+                      print(f"Warning: server Content-Type is {content_type or 'unspecified'}")
+
+                  chunks = []
+                  total = 0
+                  limit = 10 * 1024 * 1024
+                  for chunk in response.iter_content(chunk_size=65536):
+                      if not chunk:
+                          continue
+                      total += len(chunk)
+                      if total > limit:
+                          sys.exit("Response exceeded the 10 MiB safety limit; HTML was not saved.")
+                      chunks.append(chunk)
+
+                  body = b"".join(chunks)
+                  encoding = response.encoding or "utf-8"
+                  try:
+                      html = body.decode(encoding, errors="replace")
+                  except LookupError:
+                      html = body.decode("utf-8", errors="replace")
+
+                  output_path.write_text(html, encoding="utf-8")
+                  print(f"Final URL: {response.url}")
+                  print(f"HTTP status: {response.status_code}")
+                  print(f"Saved {len(body)} bytes to {output_path}")
+          except requests.RequestException as exc:
+              sys.exit(f"Failed to fetch URL: {exc}")
+          PY
+
+      - name: Commit HTML to repository
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add html/
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Save HTML extracted by workflow"
+            git push
+          fi
