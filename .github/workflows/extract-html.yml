@@ -1,16 +1,21 @@
-name: Extract HTML from URL
+name: Extract HTML with Playwright
 
 on:
   workflow_dispatch:
     inputs:
       url:
-        description: "Page URL to fetch (must start with http:// or https://)"
+        description: "Page URL to open (must start with http:// or https://)"
         required: true
         type: string
       filename:
-        description: "Output filename without .html (optional)"
+        description: "Output filename without extension"
         required: false
         default: "page"
+        type: string
+      click_selector:
+        description: "Optional CSS selector to click after page load (leave blank to only inspect)"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -23,7 +28,7 @@ concurrency:
 jobs:
   extract:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -33,22 +38,26 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install dependency
-        run: python -m pip install requests
+      - name: Install Playwright and Chromium
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
-      - name: Fetch and save HTML
+      - name: Open page and capture HTML, frames, and network log
         env:
           PAGE_URL: ${{ inputs.url }}
           OUTPUT_NAME: ${{ inputs.filename }}
+          CLICK_SELECTOR: ${{ inputs.click_selector }}
         run: |
           python - <<'PY'
+          import json
           import os
           import re
           import sys
           from pathlib import Path
           from urllib.parse import urlparse
-
-          import requests
+          from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
           url = os.environ["PAGE_URL"].strip()
           parsed = urlparse(url)
@@ -56,59 +65,159 @@ jobs:
               sys.exit("Invalid URL: enter a full http:// or https:// URL.")
 
           raw_name = os.environ.get("OUTPUT_NAME", "page").strip() or "page"
-          name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip(".-_")[:80]
-          if not name:
-              name = "page"
+          name = re.sub(r"[^A-Za-z0-9._-]+", "-", raw_name).strip(".-_")[:80] or "page"
+          click_selector = os.environ.get("CLICK_SELECTOR", "").strip()
 
           output_dir = Path("html")
           output_dir.mkdir(parents=True, exist_ok=True)
-          output_path = output_dir / f"{name}.html"
+          network_events = []
+          errors = []
 
-          headers = {
-              "User-Agent": (
-                  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-              ),
-              "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          }
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context(
+                  viewport={"width": 1365, "height": 900},
+                  accept_downloads=True,
+                  ignore_https_errors=False,
+              )
+              page = context.new_page()
 
-          try:
-              with requests.get(
-                  url, headers=headers, timeout=(15, 30), stream=True,
-                  allow_redirects=True
-              ) as response:
-                  response.raise_for_status()
-                  content_type = response.headers.get("Content-Type", "").lower()
-                  if "text/html" not in content_type and "xhtml" not in content_type:
-                      print(f"Warning: server Content-Type is {content_type or 'unspecified'}")
+              def on_request(request):
+                  network_events.append({
+                      "event": "request",
+                      "url": request.url,
+                      "method": request.method,
+                      "resource_type": request.resource_type,
+                      "frame_url": request.frame.url if request.frame else None,
+                  })
 
-                  chunks = []
-                  total = 0
-                  limit = 10 * 1024 * 1024
-                  for chunk in response.iter_content(chunk_size=65536):
-                      if not chunk:
-                          continue
-                      total += len(chunk)
-                      if total > limit:
-                          sys.exit("Response exceeded the 10 MiB safety limit; HTML was not saved.")
-                      chunks.append(chunk)
+              def on_response(response):
+                  network_events.append({
+                      "event": "response",
+                      "url": response.url,
+                      "status": response.status,
+                      "resource_type": response.request.resource_type,
+                  })
 
-                  body = b"".join(chunks)
-                  encoding = response.encoding or "utf-8"
+              def on_request_failed(request):
+                  errors.append({
+                      "url": request.url,
+                      "resource_type": request.resource_type,
+                      "failure": request.failure,
+                  })
+
+              page.on("request", on_request)
+              page.on("response", on_response)
+              page.on("requestfailed", on_request_failed)
+
+              try:
+                  response = page.goto(url, wait_until="domcontentloaded", timeout=60000)
                   try:
-                      html = body.decode(encoding, errors="replace")
-                  except LookupError:
-                      html = body.decode("utf-8", errors="replace")
+                      page.wait_for_load_state("networkidle", timeout=15000)
+                  except PlaywrightTimeoutError:
+                      print("Network did not become idle within 15 seconds; continuing capture.")
 
-                  output_path.write_text(html, encoding="utf-8")
-                  print(f"Final URL: {response.url}")
-                  print(f"HTTP status: {response.status_code}")
-                  print(f"Saved {len(body)} bytes to {output_path}")
-          except requests.RequestException as exc:
-              sys.exit(f"Failed to fetch URL: {exc}")
+                  # Save the live DOM after JavaScript has run.
+                  main_html = page.content()
+                  main_path = output_dir / f"{name}.html"
+                  main_path.write_text(main_html, encoding="utf-8")
+
+                  frame_results = []
+                  for index, frame in enumerate(page.frames):
+                      try:
+                          frame_html = frame.content()
+                          frame_name = f"{name}.frame-{index}.html"
+                          (output_dir / frame_name).write_text(frame_html, encoding="utf-8")
+                          frame_results.append({
+                              "index": index,
+                              "url": frame.url,
+                              "name": frame.name,
+                              "file": frame_name,
+                              "html_characters": len(frame_html),
+                          })
+                      except Exception as exc:
+                          frame_results.append({
+                              "index": index,
+                              "url": frame.url,
+                              "name": frame.name,
+                              "error": str(exc),
+                          })
+
+                  # Record visible controls that may be useful for follow-up inspection.
+                  controls = page.locator("a, button, input[type=button], input[type=submit]").evaluate_all(
+                      """els => els.slice(0, 250).map((el, index) => ({
+                        index,
+                        tag: el.tagName,
+                        text: (el.innerText || el.value || el.getAttribute('aria-label') || '').trim().slice(0, 240),
+                        href: el.href || null,
+                        type: el.getAttribute('type'),
+                        id: el.id || null,
+                        className: typeof el.className === 'string' ? el.className.slice(0, 240) : '',
+                        visible: !!(el.getClientRects().length)
+                      }))"""
+                  )
+
+                  click_result = None
+                  if click_selector:
+                      locator = page.locator(click_selector).first
+                      try:
+                          locator.wait_for(state="visible", timeout=10000)
+                          with page.expect_download(timeout=12000) as download_info:
+                              locator.click(timeout=10000)
+                          download = download_info.value
+                          suggested = re.sub(r"[^A-Za-z0-9._-]+", "-", download.suggested_filename)[:120]
+                          save_to = output_dir / f"{name}.download-{suggested or 'file'}"
+                          awaitable = download.save_as(str(save_to))
+                          click_result = {
+                              "selector": click_selector,
+                              "result": "download",
+                              "suggested_filename": download.suggested_filename,
+                              "saved_to": str(save_to),
+                          }
+                      except PlaywrightTimeoutError:
+                          # The click may navigate or open a new tab rather than download.
+                          click_result = {
+                              "selector": click_selector,
+                              "result": "clicked_or_timed_out",
+                              "note": "No browser download event was observed within 12 seconds; inspect network.json and any opened-page behavior.",
+                          }
+                      except Exception as exc:
+                          click_result = {
+                              "selector": click_selector,
+                              "result": "error",
+                              "error": str(exc),
+                          }
+
+                  # Capture current state after the optional interaction.
+                  (output_dir / f"{name}.after.html").write_text(page.content(), encoding="utf-8")
+                  report = {
+                      "requested_url": url,
+                      "final_url": page.url,
+                      "http_status": response.status if response else None,
+                      "page_title": page.title(),
+                      "main_html_file": str(main_path),
+                      "main_html_characters": len(main_html),
+                      "frames": frame_results,
+                      "controls": controls,
+                      "click_result": click_result,
+                      "request_failures": errors,
+                      "network_event_count": len(network_events),
+                  }
+                  (output_dir / f"{name}.report.json").write_text(
+                      json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8"
+                  )
+                  (output_dir / f"{name}.network.json").write_text(
+                      json.dumps(network_events, indent=2, ensure_ascii=False), encoding="utf-8"
+                  )
+
+                  print(json.dumps(report, indent=2, ensure_ascii=False))
+                  print(f"Saved rendered HTML, frame snapshots, report and network log under {output_dir}/")
+              finally:
+                  context.close()
+                  browser.close()
           PY
 
-      - name: Commit HTML to repository
+      - name: Commit captured files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -116,6 +225,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "No changes to commit."
           else
-            git commit -m "Save HTML extracted by workflow"
+            git commit -m "Capture rendered HTML with Playwright"
             git push
           fi
